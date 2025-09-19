@@ -1,0 +1,7 @@
+neo4j 
+pandas 
+sentence-transformers 
+langchain 
+langchain-openai 
+langchain-neo4j
+python-dotenv
