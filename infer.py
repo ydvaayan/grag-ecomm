@@ -7,11 +7,14 @@ from sentence_transformers import SentenceTransformer
 from langchain_openai import ChatOpenAI
 from langchain_neo4j import Neo4jGraph, Neo4jVector
 from langchain.prompts import ChatPromptTemplate
-print('STARTING...')
+
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
+print("STARTING...")
 # Load env
 load_dotenv()
-NEO4J_URI = os.getenv("NEO4J_URI")          # neo4j+s://<id>.databases.neo4j.io
-NEO4J_USER = os.getenv("NEO4J_USERNAME")    # Aura DB username (not Google SSO)
+NEO4J_URI = os.getenv("NEO4J_URI")  # neo4j+s://<id>.databases.neo4j.io
+NEO4J_USER = os.getenv("NEO4J_USERNAME")  # Aura DB username (not Google SSO)
 NEO4J_PASS = os.getenv("NEO4J_PASSWORD")  # Aura DB password
 DB_NAME = os.getenv("DB_NAME")
 print(f"Connecting to Neo4j at {NEO4J_URI} as user {NEO4J_USER}")
@@ -51,12 +54,14 @@ user_events = pd.read_csv("users.csv")
 # LLM (your local/vLLM endpoint stays the same)
 print("Setting up LLM...")
 llm = ChatOpenAI(
-    model="Qwen/Qwen2.5-1.5B-Instruct",         # or your local model id
-    openai_api_key="EMPTY",              # vLLM can ignore/validate as configured
+    model="Qwen/Qwen2.5-1.5B-Instruct",  # or your local model id
+    openai_api_key="EMPTY",  # vLLM can ignore/validate as configured
     openai_api_base="https://8081-01k5hptbeey4vhfxjxcg6rbp2g.cloudspaces.litng.ai/v1",
     temperature=0,
 )
 print("LLM setup complete.")
+
+
 def upsert_products(df: pd.DataFrame):
     with driver.session() as sess:
         for _, r in df.iterrows():
@@ -77,66 +82,93 @@ def upsert_products(df: pd.DataFrame):
               MERGE (t:Tag {name:tg})
               MERGE (i)-[:HAS_TAG]->(t)
             """
-            sess.run(cypher, parameters={
-                "id": r.id,
-                "title": r.title,
-                "description": r.description,
-                "price": int(r.price),
-                "rating": float(r.rating),
-                "popularity": float(r.popularity),
-                "brand": r.brand,
-                "category": r.category,
-                "seller_id": r.seller_id,
-                "tags": [t.strip() for t in str(r.tags).split(";") if t.strip()],
-                "vec": vec,
-            })
+            sess.run(
+                cypher,
+                parameters={
+                    "id": r.id,
+                    "title": r.title,
+                    "description": r.description,
+                    "price": int(r.price),
+                    "rating": float(r.rating),
+                    "popularity": float(r.popularity),
+                    "brand": r.brand,
+                    "category": r.category,
+                    "seller_id": r.seller_id,
+                    "tags": [t.strip() for t in str(r.tags).split(";") if t.strip()],
+                    "vec": vec,
+                },
+            )
+
 
 def upsert_sellers(df: pd.DataFrame):
     with driver.session() as sess:
         for _, r in df.iterrows():
-            sess.run("""
+            sess.run(
+                """
             MERGE (s:Seller {seller_id:$seller_id})
               SET s.name=$name, s.region=$region
-            """, parameters={"seller_id": r.seller_id, "name": r.name, "region": r.region})
+            """,
+                parameters={
+                    "seller_id": r.seller_id,
+                    "name": r.name,
+                    "region": r.region,
+                },
+            )
+
 
 def upsert_collections(cdf: pd.DataFrame, cidf: pd.DataFrame):
     with driver.session() as sess:
         for _, r in cdf.iterrows():
-            sess.run("""
+            sess.run(
+                """
             MERGE (c:Collection {collection_id:$cid})
               SET c.name=$name, c.description=$desc
-            """, parameters={"cid": r.collection_id, "name": r.name, "desc": r.description})
+            """,
+                parameters={
+                    "cid": r.collection_id,
+                    "name": r.name,
+                    "desc": r.description,
+                },
+            )
         for _, r in cidf.iterrows():
-            sess.run("""
+            sess.run(
+                """
             MATCH (c:Collection {collection_id:$cid}), (i:Item {item_id:$iid})
             MERGE (c)-[:HAS_ITEM]->(i)
-            """, parameters={"cid": r.collection_id, "iid": r.item_id})
+            """,
+                parameters={"cid": r.collection_id, "iid": r.item_id},
+            )
 
 
 def upsert_user_events(df: pd.DataFrame):
-  required = {"user_id", "name", "region", "preferred_categories", "budget_band"}
-  missing = required - set(df.columns)
-  if missing:
-    raise ValueError(f"users.csv missing columns: {missing}")
-  with driver.session() as sess:
-    for _, r in df.iterrows():
-      sess.run("""
+    required = {"user_id", "name", "region", "preferred_categories", "budget_band"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"users.csv missing columns: {missing}")
+    with driver.session() as sess:
+        for _, r in df.iterrows():
+            sess.run(
+                """
       MERGE (u:User {user_id:$u})
       SET u.name=$name,
       u.region=$region,
       u.preferred_categories=$cats,
       u.budget_band=$band
-      """, parameters={
-      "u": r["user_id"],
-      "name": r["name"],
-      "region": r["region"],
-      "cats": str(r["preferred_categories"]),
-      "band": r["budget_band"],
-      })
+      """,
+                parameters={
+                    "u": r["user_id"],
+                    "name": r["name"],
+                    "region": r["region"],
+                    "cats": str(r["preferred_categories"]),
+                    "band": r["budget_band"],
+                },
+            )
+
 
 def create_similarity(k=3):
     with driver.session() as sess:
-        sess.run("""
+        sess.run(
+            """
         MATCH (i:Item)
         WITH collect(i) AS items
         UNWIND items AS i1
@@ -149,22 +181,25 @@ def create_similarity(k=3):
         WITH i1, nb.n AS i2, nb.s AS sim
         MERGE (i1)-[r:SIMILAR_TO]->(i2)
         SET r.score = sim
-        """, parameters={"k": k})  # [web:45][web:15][web:49]
+        """,
+            parameters={"k": k},
+        )  # [web:45][web:15][web:49]
+
+
 print("Ingesting data...")
 # Ingest
-# upsert_sellers(sellers)
-# upsert_products(products)
-# upsert_collections(collections, collection_items)
-# upsert_user_events(user_events)
-# create_similarity(k=3)
+upsert_sellers(sellers)
+upsert_products(products)
+upsert_collections(collections, collection_items)
+upsert_user_events(user_events)
+create_similarity(k=3)
 print("Data ingestion complete.")
 # Retrieval utilities (Aura connection reused)
-graph = Neo4jGraph(url=NEO4J_URI, username=NEO4J_USER, password=NEO4J_PASS, database=DB_NAME )
-
-from langchain_community.embeddings import HuggingFaceEmbeddings
+graph = Neo4jGraph(
+    url=NEO4J_URI, username=NEO4J_USER, password=NEO4J_PASS, database=DB_NAME
+)
 
 emb = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
 vector = Neo4jVector.from_existing_graph(
     embedding=emb,
     url=NEO4J_URI,
@@ -173,7 +208,7 @@ vector = Neo4jVector.from_existing_graph(
     database=DB_NAME,
     node_label="Item",
     embedding_node_property="desc_vec",
-    text_node_properties=["title","description"],
+    text_node_properties=["title", "description"],
     index_name="item_desc_embed",
 )
 
@@ -181,10 +216,13 @@ route_prompt = ChatPromptTemplate.from_template(
     "Classify intent for recommendation: '{q}'. Reply exactly 'GRAPH' if constraints/categories/tags/collections dominate; else 'VECTOR'."
 )
 print("Setting up routing...")
+
+
 def route(q: str) -> str:
     resp = llm.invoke(route_prompt.format_messages(q=q))
     t = resp.content.strip().upper()
     return "GRAPH" if "GRAPH" in t else "VECTOR"
+
 
 def graph_candidates(user_id: str, q: str, limit: int = 20):
     cypher = """
@@ -217,19 +255,21 @@ def graph_candidates(user_id: str, q: str, limit: int = 20):
         return sess.run(cypher, parameters={"uid": user_id, "limit": limit}).data()
 
 
-
 def vector_candidates(q: str, limit: int = 20):
     docs = vector.similarity_search_with_score(q, k=limit)
     out = []
     for d, s in docs:
-        out.append({
-            "item_id": d.metadata.get("item_id"),
-            "title": d.metadata.get("title") or d.page_content[:60],
-            "description": d.page_content,
-            "price": d.metadata.get("price"),
-            "score": float(s)
-        })
+        out.append(
+            {
+                "item_id": d.metadata.get("item_id"),
+                "title": d.metadata.get("title") or d.page_content[:60],
+                "description": d.page_content,
+                "price": d.metadata.get("price"),
+                "score": float(s),
+            }
+        )
     return out
+
 
 def explain_paths(user_id: str, item_id: str, k: int = 2):
     cypher = """
@@ -244,15 +284,23 @@ def explain_paths(user_id: str, item_id: str, k: int = 2):
         res = sess.run(cypher, parameters={"u": user_id, "i": item_id, "k": k}).data()
     return res[0]["paths"] if res else []
 
+
 def recommend_for_query(user_id: str, query: str, top_k: int = 5):
     mode = route(query)
-    cands = graph_candidates(user_id, query, 30) if mode == "GRAPH" else vector_candidates(query, 30)
+    cands = (
+        graph_candidates(user_id, query, 30)
+        if mode == "GRAPH"
+        else vector_candidates(query, 30)
+    )
     sel_prompt = ChatPromptTemplate.from_template(
         "Intent: {q}\nCandidates: {c}\nPick top {k} items covering diverse categories and budgets; "
         "prefer tags relevant with intent; output JSON list with item_id and a one-sentence reason."
     )
-    selection = llm.invoke(sel_prompt.format_messages(q=query, c=str(cands), k=top_k)).content
+    selection = llm.invoke(
+        sel_prompt.format_messages(q=query, c=str(cands), k=top_k)
+    ).content
     import json
+
     try:
         picks = json.loads(selection)
     except Exception:
@@ -265,6 +313,10 @@ def recommend_for_query(user_id: str, query: str, top_k: int = 5):
         "Intent: {q}\nItems: {items}\nWrite a concise recommendation list (bullet points): "
         "name, price, reason; include a short explanation when paths indicate a match with tags/collection."
     )
-    return llm.invoke(final_prompt.format_messages(q=query, items=str(enriched))).content
+    return llm.invoke(
+        final_prompt.format_messages(q=query, items=str(enriched))
+    ).content
+
+
 print("Ready for recommendations.")
 print(recommend_for_query("U100", "I want to buy gift for fathers day", top_k=5))
