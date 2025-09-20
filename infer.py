@@ -7,12 +7,13 @@ from sentence_transformers import SentenceTransformer
 from langchain_openai import ChatOpenAI
 from langchain_neo4j import Neo4jGraph, Neo4jVector
 from langchain.prompts import ChatPromptTemplate
-
+print('STARTING...')
 # Load env
 load_dotenv()
 NEO4J_URI = os.getenv("NEO4J_URI")          # neo4j+s://<id>.databases.neo4j.io
 NEO4J_USER = os.getenv("NEO4J_USERNAME")    # Aura DB username (not Google SSO)
-NEO4J_PASS = os.getenv("NEO4J_PASSWORD")    # Aura DB password
+NEO4J_PASS = os.getenv("NEO4J_PASSWORD")  # Aura DB password
+DB_NAME = os.getenv("DB_NAME")
 print(f"Connecting to Neo4j at {NEO4J_URI} as user {NEO4J_USER}")
 # Connect (Aura requires TLS scheme neo4j+s)
 driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))  # [Aura TLS]
@@ -35,7 +36,7 @@ CREATE VECTOR INDEX item_desc_embed IF NOT EXISTS
 FOR (i:Item) ON (i.desc_vec)
 OPTIONS {indexConfig: {`vector.dimensions`: 384, `vector.similarity_function`: "cosine"}};
 """
-
+print("Setting up schema...")
 with driver.session() as sess:
     for stmt in [s.strip() for s in schema.split(";") if s.strip()]:
         sess.run(stmt)
@@ -48,14 +49,14 @@ collection_items = pd.read_csv("collection_items.csv")
 user_events = pd.read_csv("users.csv")
 
 # LLM (your local/vLLM endpoint stays the same)
-
+print("Setting up LLM...")
 llm = ChatOpenAI(
-    model="Qwen2.5-1.5B-Instruct",         # or your local model id
+    model="Qwen/Qwen2.5-1.5B-Instruct",         # or your local model id
     openai_api_key="EMPTY",              # vLLM can ignore/validate as configured
     openai_api_base="https://8081-01k5hptbeey4vhfxjxcg6rbp2g.cloudspaces.litng.ai/v1",
     temperature=0,
 )
-
+print("LLM setup complete.")
 def upsert_products(df: pd.DataFrame):
     with driver.session() as sess:
         for _, r in df.iterrows():
@@ -111,55 +112,75 @@ def upsert_collections(cdf: pd.DataFrame, cidf: pd.DataFrame):
             MERGE (c)-[:HAS_ITEM]->(i)
             """, parameters={"cid": r.collection_id, "iid": r.item_id})
 
+
 def upsert_user_events(df: pd.DataFrame):
-    # APOC Core is supported in Aura; apoc.create.relationship is allowed.
-    with driver.session() as sess:
-        for uid, grp in df.groupby("user_id"):
-            sess.run("MERGE (u:User {user_id:$u})", parameters={"u": uid})
-            for _, r in grp.iterrows():
-                sess.run("""
-                MATCH (u:User {user_id:$u}), (i:Item {item_id:$iid})
-                CALL apoc.create.relationship(u, $rt, {ts:$ts}, i) YIELD rel
-                RETURN rel
-                """, parameters={"u": r.user_id, "iid": r.item_id, "rt": r.type, "ts": r.ts})
+  required = {"user_id", "name", "region", "preferred_categories", "budget_band"}
+  missing = required - set(df.columns)
+  if missing:
+    raise ValueError(f"users.csv missing columns: {missing}")
+  with driver.session() as sess:
+    for _, r in df.iterrows():
+      sess.run("""
+      MERGE (u:User {user_id:$u})
+      SET u.name=$name,
+      u.region=$region,
+      u.preferred_categories=$cats,
+      u.budget_band=$band
+      """, parameters={
+      "u": r["user_id"],
+      "name": r["name"],
+      "region": r["region"],
+      "cats": str(r["preferred_categories"]),
+      "band": r["budget_band"],
+      })
 
 def create_similarity(k=3):
-    # Aura-friendly: use Cypher vector function to compute pairwise cosine on stored embeddings.
-    # For large catalogs, do this offline or with batching to avoid O(N^2) cost.
     with driver.session() as sess:
         sess.run("""
-        // Compute top-k neighbors per item using vector.similarity.cosine
         MATCH (i:Item)
         WITH collect(i) AS items
         UNWIND items AS i1
-        WITH i1, [i IN items WHERE i<>i1] AS others
+        WITH i1, [i IN items WHERE i <> i1] AS others
         UNWIND others AS i2
         WITH i1, i2, vector.similarity.cosine(i1.desc_vec, i2.desc_vec) AS sim
         ORDER BY i1.item_id, sim DESC
         WITH i1, collect({n:i2, s:sim})[0..$k] AS nbrs
         UNWIND nbrs AS nb
-        MERGE (i1)-[r:SIMILAR_TO]->(nb.n)
-        SET r.score = nb.s
-        """, parameters={"k": k})
-
+        WITH i1, nb.n AS i2, nb.s AS sim
+        MERGE (i1)-[r:SIMILAR_TO]->(i2)
+        SET r.score = sim
+        """, parameters={"k": k})  # [web:45][web:15][web:49]
+print("Ingesting data...")
 # Ingest
-upsert_sellers(sellers)
-upsert_products(products)
-upsert_collections(collections, collection_items)
-upsert_user_events(user_events)
-create_similarity(k=3)
-
+# upsert_sellers(sellers)
+# upsert_products(products)
+# upsert_collections(collections, collection_items)
+# upsert_user_events(user_events)
+# create_similarity(k=3)
+print("Data ingestion complete.")
 # Retrieval utilities (Aura connection reused)
-graph = Neo4jGraph(url=NEO4J_URI, username=NEO4J_USER, password=NEO4J_PASS)
-vector = Neo4jVector(
-    url=NEO4J_URI, username=NEO4J_USER, password=NEO4J_PASS,
-    node_label="Item", text_node_property="description", embedding_node_property="desc_vec"
+graph = Neo4jGraph(url=NEO4J_URI, username=NEO4J_USER, password=NEO4J_PASS, database=DB_NAME )
+
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
+emb = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+vector = Neo4jVector.from_existing_graph(
+    embedding=emb,
+    url=NEO4J_URI,
+    username=NEO4J_USER,
+    password=NEO4J_PASS,
+    database=DB_NAME,
+    node_label="Item",
+    embedding_node_property="desc_vec",
+    text_node_properties=["title","description"],
+    index_name="item_desc_embed",
 )
 
 route_prompt = ChatPromptTemplate.from_template(
     "Classify intent for recommendation: '{q}'. Reply exactly 'GRAPH' if constraints/categories/tags/collections dominate; else 'VECTOR'."
 )
-
+print("Setting up routing...")
 def route(q: str) -> str:
     resp = llm.invoke(route_prompt.format_messages(q=q))
     t = resp.content.strip().upper()
@@ -167,14 +188,23 @@ def route(q: str) -> str:
 
 def graph_candidates(user_id: str, q: str, limit: int = 20):
     cypher = """
+    // Collect Father's Day collection items; cast name to string before lower
     OPTIONAL MATCH (col:Collection)-[:HAS_ITEM]->(i:Item)
-    WHERE toLower(col.name) CONTAINS 'father'
-    WITH collect(i) AS col_items
+    WHERE toLower(toString(col.name)) CONTAINS toLower('father')
+    WITH collect(DISTINCT i) AS col_items
+
+    // Collect items by tags; cast tag.name to string and filter out nulls
     OPTIONAL MATCH (i2:Item)-[:HAS_TAG]->(t:Tag)
-    WHERE toLower(t.name) IN ['gift','father','men']
-    WITH col_items + collect(i2) AS cands
-    UNWIND cands AS c
+    WHERE t.name IS NOT NULL AND toLower(toString(t.name)) IN ['gift','father','men']
+    WITH col_items, collect(DISTINCT i2) AS tag_items
+
+    // Concatenate lists and deduplicate without implicit grouping
+    WITH col_items + tag_items AS lists
+    UNWIND lists AS lst
+    UNWIND lst AS c
     WITH DISTINCT c
+
+    // Personalize and score (no string casts needed here)
     OPTIONAL MATCH (:User {user_id:$uid})-[:VIEWED|PURCHASED]->(h:Item)
     OPTIONAL MATCH (h)-[:HAS_TAG]->(ht)<-[:HAS_TAG]-(c)
     OPTIONAL MATCH (h)-[:IN_CATEGORY]->(hc)<-[:IN_CATEGORY]-(c)
@@ -185,6 +215,8 @@ def graph_candidates(user_id: str, q: str, limit: int = 20):
     """
     with driver.session() as sess:
         return sess.run(cypher, parameters={"uid": user_id, "limit": limit}).data()
+
+
 
 def vector_candidates(q: str, limit: int = 20):
     docs = vector.similarity_search_with_score(q, k=limit)
@@ -217,7 +249,7 @@ def recommend_for_query(user_id: str, query: str, top_k: int = 5):
     cands = graph_candidates(user_id, query, 30) if mode == "GRAPH" else vector_candidates(query, 30)
     sel_prompt = ChatPromptTemplate.from_template(
         "Intent: {q}\nCandidates: {c}\nPick top {k} items covering diverse categories and budgets; "
-        "prefer tags gift/father/men; output JSON list with item_id and a one-sentence reason."
+        "prefer tags relevant with intent; output JSON list with item_id and a one-sentence reason."
     )
     selection = llm.invoke(sel_prompt.format_messages(q=query, c=str(cands), k=top_k)).content
     import json
@@ -234,5 +266,5 @@ def recommend_for_query(user_id: str, query: str, top_k: int = 5):
         "name, price, reason; include a short explanation when paths indicate a match with tags/collection."
     )
     return llm.invoke(final_prompt.format_messages(q=query, items=str(enriched))).content
-
+print("Ready for recommendations.")
 print(recommend_for_query("U100", "I want to buy gift for fathers day", top_k=5))
